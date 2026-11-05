@@ -1947,7 +1947,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (latest.runtimeMode === "legacy") {
         const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
           latest.errorCode === "execution_reconciliation_required";
-        if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
+        const blocker = await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId));
+        const reassignedExecutionStopped = latest.status === "cancelled" && latest.errorCode === "issue_reassigned" && !blocker;
+        if (((latest.status !== "cancelled" || cancelledAdmission) && blocker) || reassignedExecutionStopped) {
           await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
             scope.onError?.(err);
             logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");

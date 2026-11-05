@@ -10,6 +10,7 @@ import { boundRunIssueId } from "../run-task-binding.js";
 import { recoveryRunContextColumn, recoveryRunVersionColumn } from "./run-context-read.js";
 import { recoveryRunResultColumn } from "./run-result-read.js";
 import { readLegacyDispositionSource } from "./legacy-disposition-read.js";
+import { isReassignmentCancellation, isRecoveryFailure, selectAssignedRecoverySource, summarizeOwnedContinuationFailures } from "./continuation-ownership.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -187,12 +188,6 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "running",
   "scheduled_retry",
 ] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
-  "interrupted",
-  "failed",
-  "cancelled",
-  "timed_out",
-] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 5 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 15 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -230,6 +225,7 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    statusVersion?: number;
   };
 };
 
@@ -505,10 +501,7 @@ function didAutomaticRecoveryFail(
   const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
   return (
-    latestRetryReason === expectedRetryReason &&
-    UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
-      latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
-    )
+    latestRetryReason === expectedRetryReason && isRecoveryFailure(latestRun)
   );
 }
 
@@ -909,12 +902,7 @@ function isOperatorCancelledRun(
 }
 
 function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
-  return Boolean(
-    latestRun &&
-    UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
-      latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
-    ),
-  );
+  return isRecoveryFailure(latestRun);
 }
 
 function isSuccessfulInProgressContinuationRun(
@@ -1055,16 +1043,33 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
+  async function getCurrentAssignmentStartedAt(issue: Pick<RecoveryIssue, "companyId" | "id">, agentId: string) {
+    return db.select({ createdAt: activityLog.createdAt }).from(activityLog).where(and(
+      eq(activityLog.companyId, issue.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issue.id),
+      eq(activityLog.action, "issue.updated"),
+      sql`coalesce(${activityLog.details} #>> '{changes,assigneeAgentId,to}', ${activityLog.details} ->> 'assigneeAgentId') = ${agentId}`,
+      sql`(${activityLog.details} #> '{changes,assigneeAgentId}' is not null or
+        (${activityLog.details} -> '_previous' ? 'assigneeAgentId' and
+         ${activityLog.details} #>> '{_previous,assigneeAgentId}' is distinct from ${agentId}))`,
+    )).orderBy(desc(activityLog.createdAt), desc(activityLog.id)).limit(1)
+      .then(rows => rows[0]?.createdAt ?? null);
+  }
+
   async function summarizeRecentContinuationRetries(
     companyId: string,
     issueId: string,
     agentId: string,
     errorCodeToMatch: string | null,
     since: Date | null = null,
+    assignedAt: Date | null = null,
   ) {
     const rows = await db
       .select({
         id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        createdAt: heartbeatRuns.createdAt,
         status: heartbeatRuns.status,
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
@@ -1074,7 +1079,6 @@ export function recoveryService(
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           ...(since
             ? [
@@ -1089,29 +1093,7 @@ export function recoveryService(
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(10);
 
-    let consecutive = 0;
-    let latestFinishedAt: Date | null = null;
-    for (const row of rows) {
-      const ctx = parseObject(row.contextSnapshot);
-      const retryReason = readNonEmptyString(ctx.retryReason);
-      if (retryReason !== "issue_continuation_needed") break;
-      if (
-        !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
-          row.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
-        )
-      ) {
-        break;
-      }
-
-      const rowErrorCode = readNonEmptyString(row.errorCode);
-      if (errorCodeToMatch !== rowErrorCode) {
-        break;
-      }
-
-      consecutive += 1;
-      if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
-    }
-    return { consecutive, latestFinishedAt };
+    return summarizeOwnedContinuationFailures(rows, agentId, errorCodeToMatch, assignedAt);
   }
 
   async function hasActiveExecutionPath(
@@ -2034,12 +2016,10 @@ export function recoveryService(
             eq(heartbeatRuns.agentId, input.agentId),
           ),
         );
-      if (
-        predecessor &&
-        ["failed", "timed_out", "interrupted", "cancelled"].includes(
-          predecessor.status,
-        )
-      ) {
+      if (predecessor && isReassignmentCancellation(predecessor)) {
+        return enqueueStrandedIssueRecovery({ ...input, retryOfRunId: null });
+      }
+      if (predecessor && isRecoveryFailure(predecessor)) {
         // Failure recovery shares the durable incident budget and delay. It
         // cannot fall through into the productive-work continuation queue.
         if (predecessor.runtimeMode === "native") return null;
@@ -2146,18 +2126,21 @@ export function recoveryService(
     return queued;
   }
 
-  async function enqueueInitialAssignedTodoDispatch(
+  async function enqueueAssignedIssueDispatch(
     issue: RecoveryIssue,
     agentId: string,
+    handoffSourceRunId?: string | null,
   ) {
     return deps.enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
+      issueStateGuard: { statuses: [issue.status], assigneeAgentId: agentId, statusVersion: issue.statusVersion },
       payload: withRecoveryContext(
         {
           issueId: issue.id,
-          mutation: "assigned_todo_liveness_dispatch",
+          mutation: handoffSourceRunId ? "assigned_handoff_liveness_dispatch" : "assigned_todo_liveness_dispatch",
+          ...(handoffSourceRunId ? { handoffSourceRunId } : {}),
         },
         "normal_model",
       ),
@@ -2168,7 +2151,8 @@ export function recoveryService(
           issueId: issue.id,
           taskId: issue.id,
           wakeReason: "issue_assigned",
-          source: "issue.assigned_todo_liveness_dispatch",
+          source: handoffSourceRunId ? "issue.assigned_handoff_liveness_dispatch" : "issue.assigned_todo_liveness_dispatch",
+          ...(handoffSourceRunId ? { handoffSourceRunId } : {}),
         },
         "normal_model",
       ),
@@ -2967,20 +2951,6 @@ export function recoveryService(
     );
   }
 
-  async function openChildIssues(issue: RecoveryIssue) {
-    return db
-      .select({ id: issues.id, identifier: issues.identifier })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, issue.companyId),
-          eq(issues.parentId, issue.id),
-          visibleIssueCondition(),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      );
-  }
-
   async function healthyOpenChildIssues(
     issue: Pick<RecoveryIssue, "id" | "companyId" | "projectWorkspaceId">,
     sameWorkspaceOnly = false,
@@ -3016,16 +2986,11 @@ export function recoveryService(
   async function resolveContinuationWaitingOnReview(
     issue: RecoveryIssue,
   ) {
-    const [existingBlockers, openChildren] = await Promise.all([
-      existingUnresolvedBlockerIssues(issue.companyId, issue.id),
-      openChildIssues(issue),
-    ]);
-    const blockedByIssueIds = [
-      ...new Set([
-        ...existingBlockers.map((row) => row.id),
-        ...openChildren.map((row) => row.id),
-      ]),
-    ];
+    const existingBlockers = await existingUnresolvedBlockerIssues(
+      issue.companyId,
+      issue.id,
+    );
+    const blockedByIssueIds = existingBlockers.map((row) => row.id);
     if (blockedByIssueIds.length === 0) return null;
 
     const updated = await issuesSvc.update(issue.id, {
@@ -3034,10 +2999,7 @@ export function recoveryService(
     });
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([
-      ...openChildren,
-      ...existingBlockers,
-    ]);
+    const waitingOn = formatIssueLinksForComment(existingBlockers);
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
@@ -3905,6 +3867,11 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
+    if (current.status !== "in_review" && latestRun && current.assigneeAgentId) {
+      const assignedAt = await getCurrentAssignmentStartedAt(current, current.assigneeAgentId);
+      if (selectAssignedRecoverySource(latestRun, current.assigneeAgentId, assignedAt,
+        isOperatorCancelledRun(latestRun, current.assigneeAgentId)).kind !== "current") return "skipped";
+    }
 
     const episode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
@@ -4669,7 +4636,20 @@ export function recoveryService(
         continue;
       }
 
-      let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const latestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const assignmentStartedAt = issue.status === "in_review" ? null
+        : await getCurrentAssignmentStartedAt(issue, agentId);
+      const assignmentSource = selectAssignedRecoverySource(
+        latestIssueRun, agentId, assignmentStartedAt,
+        issue.status !== "in_review" && isOperatorCancelledRun(latestIssueRun, agentId),
+      );
+      if (assignmentSource.kind === "held") {
+        result.operatorCancelExempted += 1;
+        continue;
+      }
+      const needsAssignmentDispatch = issue.status !== "in_review" && assignmentSource.kind === "assignment";
+      let latestRun = issue.status === "in_review" ? latestIssueRun
+        : assignmentSource.kind === "current" ? assignmentSource.run : null;
       // Terminal run/wake rows survive a restart even if finalization never
       // reached the escalation transaction. Retry that idempotent disposition
       // before the participant-only review branch can skip pathless reviews.
@@ -4910,6 +4890,18 @@ export function recoveryService(
         }
         continue;
       }
+      if (needsAssignmentDispatch && assignmentSource.kind === "assignment") {
+        if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
+        const queued = await enqueueAssignedIssueDispatch(issue, agentId, assignmentSource.sourceRunId);
+        if (queued) {
+          result.assignmentDispatched += 1;
+          result.issueIds.push(issue.id);
+        } else result.skipped += 1;
+        continue;
+      }
       const nativeUnblockAction = await nativeBlockedUnblockAction(
         issue,
         latestRun,
@@ -5050,6 +5042,7 @@ export function recoveryService(
             agentId,
             CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE,
             acceptedInteractionResolvedAt,
+            assignmentStartedAt,
           );
         const successfulRunSinceResolution = await hasSuccessfulIssueRunSince(
           issue.companyId,
@@ -5386,7 +5379,7 @@ export function recoveryService(
             continue;
           }
 
-          const queued = await enqueueInitialAssignedTodoDispatch(
+          const queued = await enqueueAssignedIssueDispatch(
             issue,
             agentId,
           );
@@ -5688,6 +5681,8 @@ export function recoveryService(
               issue.id,
               agentId,
               classification.errorCode,
+              null,
+              assignmentStartedAt,
             );
           if (consecutive >= classification.maxAttempts) {
             const attemptCopy =

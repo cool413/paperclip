@@ -1,4 +1,5 @@
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
+import { issueService } from "../../../services/issues.js";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { eq, sql } from "drizzle-orm";
@@ -20,6 +21,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueDocuments,
+  issueComments,
   issueRelations,
   issueRecoveryActions,
   issueTreeHolds,
@@ -33,6 +35,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
+import { buildContinuationSummaryMarkdown, refreshIssueContinuationSummary } from "../../../services/issue-continuation-summary.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { reserveRunBudget } from "../../../services/budget-reservations.js";
@@ -292,6 +295,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     issueId: string;
     agentId: string;
     body: string;
+    sourceRunId?: string;
   }) {
     const documentId = randomUUID();
     const revisionId = randomUUID();
@@ -315,6 +319,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       format: "markdown",
       body: input.body,
       createdByAgentId: input.agentId,
+      createdByRunId: input.sourceRunId ?? null,
     });
     await db.insert(issueDocuments).values({
       companyId: input.companyId,
@@ -322,6 +327,20 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       documentId,
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
     });
+  }
+
+  async function seedCurrentParkingSummary(input: { companyId: string; issueId: string; agentId: string }) {
+    const [issue] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, input.agentId));
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: input.companyId,
+      agentId: input.agentId, issueId: input.issueId, scopeKind: "issue", status: "succeeded",
+      finishedAt: new Date(), contextSnapshot: { issueId: input.issueId } }).returning();
+    const body = buildContinuationSummaryMarkdown({ issue, run: source, agent,
+      previousSummaryBody: "## Next Action\n\n- Wait for reviewer feedback or approval before continuing executor work.",
+      executionVersion: { companyId: input.companyId, issueId: issue.id, runId: source.id,
+        statusVersion: issue.statusVersion, executionState: issue.executionState } });
+    await seedContinuationSummary({ ...input, sourceRunId: source.id, body });
+    return { issue, agent, source, body };
   }
 
   it.each([
@@ -1291,18 +1310,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
       await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
-      await seedContinuationSummary({
-        companyId,
-        issueId,
-        agentId,
-        body: [
-          "# Continuation Summary",
-          "",
-          "## Next Action",
-          "",
-          "- Wait for reviewer feedback or approval before continuing executor work.",
-        ].join("\n"),
-      });
+      await seedCurrentParkingSummary({ companyId, issueId, agentId });
 
       const adapter = createPostgresRunDispatchAdapter(db);
       const now = new Date();
@@ -1326,6 +1334,204 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         outcome: "cancelled",
         errorCode: "issue_continuation_waiting_on_review",
       });
+    });
+  });
+
+  describe("continuation summary execution version", () => {
+    async function seedSummaryHandoff() {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const reviewerId = randomUUID();
+      await seedAgent({ id: reviewerId, companyId, name: "Reviewer" });
+      await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId: reviewerId });
+      const [source] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: reviewerId, issueId, scopeKind: "issue", status: "succeeded",
+        finishedAt: new Date(), contextSnapshot: { issueId },
+      }).returning();
+      const [reviewer] = await db.select().from(agents).where(eq(agents.id, reviewerId));
+      const summary = await refreshIssueContinuationSummary({ db, issueId, run: source, agent: reviewer });
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: agentId, executionState: null })
+        .where(eq(issues.id, issueId));
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId,
+        authorUserId: "local-board", body: "Changes requested; return this work to the engineer." }).returning();
+      return { companyId, agentId, issueId, source, reviewer, summary: summary!, comment };
+    }
+
+    async function continuation(f: Awaited<ReturnType<typeof seedSummaryHandoff>>, context: Record<string, unknown> = {}) {
+      return seedRun({ companyId: f.companyId, agentId: f.agentId,
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_continuation_needed", ...context } });
+    }
+
+    it.each(["document", "snapshot", "wake snapshot"])("ignores the stale review %s after a helper handoff with null decision state", async kind => {
+      const f = await seedSummaryHandoff();
+      const snapshot = { body: f.summary.body, updatedAt: f.summary.updatedAt.toISOString() };
+      const runId = await continuation(f, kind === "snapshot" ? { paperclipContinuationSummary: snapshot }
+        : kind === "wake snapshot" ? { paperclipWake: { continuationSummary: snapshot } } : {});
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ ...f, runId, expectedStatus: "queued", now: new Date() }))
+        .toMatchObject({ outcome: "not_stale" });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].status).toBe("queued");
+    });
+
+    it("preserves the accepted comment and reassignment wake", async () => {
+      const f = await seedSummaryHandoff();
+      const runId = await continuation(f, { wakeReason: "issue_commented", wakeCommentId: f.comment.id });
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ ...f, runId, expectedStatus: "queued", now: new Date() }))
+        .toMatchObject({ outcome: "not_stale" });
+    });
+
+    it("does not carry a previous review wait into a new handoff summary", async () => {
+      const f = await seedSummaryHandoff();
+      const summary = await refreshIssueContinuationSummary({ db, issueId: f.issueId, run: f.source, agent: f.reviewer });
+      expect(summary!.body).not.toContain("- Wait for reviewer feedback or approval before continuing executor work.");
+      const runId = await continuation(f);
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ ...f, runId, expectedStatus: "queued", now: new Date() }))
+        .toMatchObject({ outcome: "not_stale" });
+    });
+
+    it("does not treat an unversioned legacy document as cancellation authority", async () => {
+      const f = await seedSummaryHandoff();
+      await db.update(documents).set({ latestBody: "## Next Action\n\n- Wait for reviewer feedback." })
+        .where(eq(documents.latestRevisionId, f.summary.latestRevisionId!));
+      const runId = await continuation(f);
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ ...f, runId, expectedStatus: "queued", now: new Date() }))
+        .toMatchObject({ outcome: "not_stale" });
+    });
+
+    it("dispatches the new handoff after discarding the stale summary", async () => {
+      const f = await seedSummaryHandoff();
+      const runId = await continuation(f, { paperclipContinuationSummary: { body: f.summary.body } });
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
+      const reservation = await reserveRunBudget(db, f.companyId, runId, null);
+      const dispatch = vi.fn(async () => "resumed work");
+      const input = { ...f, runId, reservationId: reservation.id, expectedStatus: "running" as const, now: new Date(), dispatch };
+      const first = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(input);
+      expect(first.dispatched).toBe(true);
+      if (first.dispatched) expect(await first.resultPromise).toBe("resumed work");
+      expect(dispatch).toHaveBeenCalledOnce();
+    });
+
+    it("keeps a current-version review wait effective after unrelated queue bookkeeping", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const f = await seedCurrentParkingSummary({ companyId, agentId, issueId });
+      await refreshIssueContinuationSummary({ db, issueId, run: f.source, agent: f.agent });
+      const runId = await seedRun({ companyId, agentId,
+        contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" } });
+      await db.update(issues).set({ executionRunId: runId, updatedAt: new Date() }).where(eq(issues.id, issueId));
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() }))
+        .toMatchObject({ outcome: "cancelled", errorCode: "issue_continuation_waiting_on_review" });
+    });
+
+    it.each(["service same-owner roundtrip", "execution state", "foreign issue", "foreign company", "foreign run", "unattested revision", "old queued revision"])(
+      "rejects %s summary authority", async change => {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+        const f = await seedCurrentParkingSummary({ companyId, agentId, issueId });
+        const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId, wakeReason: "issue_continuation_needed",
+          paperclipContinuationSummary: { body: f.body } } });
+        if (change === "service same-owner roundtrip") {
+          const nextAgentId = randomUUID();
+          await seedAgent({ id: nextAgentId, companyId, name: "Temporary owner" });
+          await issueService(db).update(issueId, { assigneeAgentId: nextAgentId });
+          await issueService(db).update(issueId, { assigneeAgentId: agentId });
+        } else if (change === "execution state") {
+          await db.update(issues).set({ executionState: { status: "pending", lastDecisionOutcome: null } }).where(eq(issues.id, issueId));
+        } else if (change === "foreign issue" || change === "foreign company") {
+          const foreign = change === "foreign company" ? await seedCompanyAndAgent() : { companyId, agentId };
+          const foreignId = randomUUID();
+          await seedIssue({ companyId: foreign.companyId, issueId: foreignId, status: "in_progress", assigneeAgentId: foreign.agentId });
+          const [foreignRun] = await db.insert(heartbeatRuns).values({ companyId: foreign.companyId,
+            agentId: foreign.agentId, issueId: foreignId, scopeKind: "issue", status: "succeeded",
+            contextSnapshot: { issueId } }).returning();
+          const body = f.body.replaceAll(f.source.id, foreignRun.id);
+          await db.update(documentRevisions).set({ body, createdByRunId: foreignRun.id }).where(eq(documentRevisions.companyId, companyId));
+          await db.update(documents).set({ latestBody: body }).where(eq(documents.companyId, companyId));
+        } else if (change === "foreign run" || change === "unattested revision") {
+          await db.update(documentRevisions).set({ createdByRunId: change === "foreign run" ? runId : null });
+        } else {
+          const [document] = await db.select().from(documents);
+          const nextRevisionId = randomUUID();
+          const body = f.body.replace("Wait for reviewer feedback or approval before continuing executor work.", "Resume implementation.");
+          await db.insert(documentRevisions).values({ id: nextRevisionId, companyId, documentId: document.id,
+            revisionNumber: 2, body, createdByAgentId: agentId, createdByRunId: f.source.id });
+          await db.update(documents).set({ latestBody: body, latestRevisionId: nextRevisionId, latestRevisionNumber: 2 })
+            .where(eq(documents.id, document.id));
+        }
+        expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() }))
+          .toMatchObject({ outcome: "not_stale" });
+      });
+
+    it.each(["company", "issue", "invalid run", "malformed"])("rejects a summary with %s version metadata", async field => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const f = await seedCurrentParkingSummary({ companyId, agentId, issueId });
+      const body = field === "malformed" ? f.body.replace('"statusVersion":0', '"statusVersion":')
+        : f.body.replace(field === "company" ? `"companyId":"${companyId}"`
+          : field === "issue" ? `"issueId":"${issueId}"` : `"runId":"${f.source.id}"`,
+        field === "company" ? `"companyId":"${randomUUID()}"`
+          : field === "issue" ? `"issueId":"${randomUUID()}"` : '"runId":"invalid-run-id"');
+      await db.update(documents).set({ latestBody: body }).where(eq(documents.companyId, companyId));
+      await db.update(documentRevisions).set({ body }).where(eq(documentRevisions.companyId, companyId));
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" } });
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() }))
+        .toMatchObject({ outcome: "not_stale" });
+    });
+
+    it("reads the committed handoff version after waiting for the issue lock", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await seedCurrentParkingSummary({ companyId, agentId, issueId });
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" } });
+      let locked!: () => void;
+      let release!: () => void;
+      const acquired = new Promise<void>(resolve => { locked = resolve; });
+      const proceed = new Promise<void>(resolve => { release = resolve; });
+      const handoff = db.transaction(async tx => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+        locked();
+        await proceed;
+        await tx.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+        await tx.update(issues).set({ status: "in_progress", executionState: null }).where(eq(issues.id, issueId));
+      });
+      await Promise.race([acquired, handoff]);
+      const cancellation = createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() });
+      try {
+        expect(await waitForBlockedForUpdate("issues")).toBe(true);
+        release();
+        await handoff;
+        expect(await cancellation).toMatchObject({ outcome: "not_stale" });
+      } finally {
+        release();
+        await Promise.allSettled([handoff, cancellation]);
+      }
+    });
+
+    it.each(["dependency", "pause", "approval", "budget"])("retains the real %s gate despite a stale summary", async guard => {
+      const f = await seedSummaryHandoff();
+      const runId = await continuation(f);
+      if (guard === "dependency") {
+        const blockerId = randomUUID();
+        await seedIssue({ companyId: f.companyId, issueId: blockerId, status: "todo" });
+        await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId, relatedIssueId: f.issueId, type: "blocks" });
+      } else if (guard === "pause") {
+        await db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.issueId,
+          mode: "pause", status: "active", reason: "operator hold", releasePolicy: { strategy: "manual" } });
+      } else if (guard === "approval") {
+        await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, f.agentId));
+      } else {
+        await budgetService(db).upsertPolicy(f.companyId, { scopeType: "company", scopeId: f.companyId,
+          metric: "billed_cents", windowKind: "lifetime", amount: 100, notifyEnabled: false }, null);
+        await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, provider: "test", model: "historical-charge",
+          inputTokens: 1, outputTokens: 1, costCents: 110, occurredAt: new Date() });
+      }
+      const gate = await createPostgresRunDispatchAdapter(db).evaluateScheduledRetryGate({ ...f, runId, retryReasonOverride: "issue_continuation_needed", now: new Date() });
+      expect(gate).toMatchObject({ allowed: false, errorCode: guard === "dependency" ? "issue_dependencies_blocked"
+        : guard === "pause" ? "issue_paused" : guard === "approval" ? "agent_not_invokable" : "budget_blocked" });
     });
   });
 
