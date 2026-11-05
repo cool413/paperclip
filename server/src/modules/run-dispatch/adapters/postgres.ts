@@ -6,13 +6,16 @@ import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   agents,
+  documentRevisions,
+  documents,
+  issueDocuments,
   connectionIntentDeliveries,
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, isUuidLike } from "@paperclipai/shared";
 import { withAccountingTransaction } from "../../../services/accounting-transaction.js";
 import type { ActivityPublication } from "../../../services/activity-log.js";
 import { parseObject } from "../../../adapters/utils.js";
@@ -35,6 +38,7 @@ import {
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
+  readCurrentContinuationSummaryVersion,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
@@ -521,6 +525,7 @@ export function createPostgresRunDispatchAdapter(
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
+        statusVersion: issues.statusVersion,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -552,15 +557,37 @@ export function createPostgresRunDispatchAdapter(
     let continuationSummaryBody: string | null = null;
     let continuationParksExecutor = false;
     if (continuationParkApplies) {
-      const queuedWake = parseObject(context.paperclipWake);
-      const queuedContinuationSummary =
-        readNonEmptyString(parseObject(context.paperclipContinuationSummary).body) ??
-        readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
-      const currentContinuationSummary = queuedContinuationSummary
-        ? null
-        : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
-      continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
-      continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
+      const summary = await getIssueContinuationSummaryDocument(dbOrTx, issueId, input.companyId);
+      continuationSummaryBody = summary?.body ?? null;
+      const version = readCurrentContinuationSummaryVersion(continuationSummaryBody, issue);
+      if (version && isUuidLike(version.runId) && summary?.latestRevisionId && continuationSummaryBody
+        && continuationSummaryParksExecutor(continuationSummaryBody)) {
+        const [source] = await dbOrTx.select({ id: heartbeatRuns.id })
+          .from(documentRevisions)
+          .innerJoin(documents, and(
+            eq(documents.id, documentRevisions.documentId),
+            eq(documents.companyId, input.companyId),
+            eq(documents.latestRevisionId, documentRevisions.id),
+          ))
+          .innerJoin(issueDocuments, and(
+            eq(issueDocuments.documentId, documents.id),
+            eq(issueDocuments.companyId, input.companyId),
+            eq(issueDocuments.issueId, issueId),
+          ))
+          .innerJoin(heartbeatRuns, and(
+            eq(heartbeatRuns.id, documentRevisions.createdByRunId),
+            eq(heartbeatRuns.companyId, input.companyId),
+            sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+          ))
+          .where(and(
+            eq(documentRevisions.id, summary.latestRevisionId),
+            eq(documentRevisions.companyId, input.companyId),
+            eq(documentRevisions.body, continuationSummaryBody),
+            eq(heartbeatRuns.id, version.runId),
+          ))
+          .limit(1);
+        continuationParksExecutor = Boolean(source);
+      }
     }
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);

@@ -868,6 +868,28 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId))).toHaveLength(3);
   });
 
+  it("delivers deferred comments once after a normal issue_reassigned cancellation", async () => {
+    const seeded = await seedQueue();
+    await db.update(agents).set({ adapterType: "claude_local",
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, seeded.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled",
+      errorCode: "issue_reassigned", resultJson: { reassignmentStopConfirmed: true },
+      finishedAt: new Date("2026-08-22T15:03:00.000Z"),
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() },
+    });
+    await Promise.all([heartbeatService(db).resumeQueuedRuns(), heartbeatService(db).resumeQueuedRuns()]);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    expect(wake.status).toBe("coalesced");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
+    expect(successor.contextSnapshot?.wakeCommentIds).toEqual(seeded.commentIds);
+    await heartbeatService(db).resumeQueuedRuns();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId))).toHaveLength(3);
+  });
+
   async function promoteQueue(seeded: Awaited<ReturnType<typeof seedQueue>>) {
     const queueRunId = randomUUID();
     const wake = await db

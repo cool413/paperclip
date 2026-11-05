@@ -1,3 +1,4 @@
+import { createHeartbeatTestCleanup } from "./helpers/heartbeat-test-cleanup.js";
 import * as conversationContinuation from "../services/conversation-continuation.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import * as workspaceRuntime from "../services/workspace-runtime.js";
@@ -517,7 +518,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   }, 20_000);
 
+  const fixtureCleanup = createHeartbeatTestCleanup();
+
   afterEach(async () => {
+    fixtureCleanup.release();
     vi.clearAllMocks();
     // A recovery policy can stop before adapter dispatch; do not leak an
     // unused one-shot failure into the next test's otherwise healthy run.
@@ -2154,6 +2158,215 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
     expect(wake.status).toBe("deferred_issue_execution");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+  });
+
+  function recoveryAgentRow(
+    rowId: (typeof agents.$inferInsert)["id"],
+    companyId: (typeof agents.$inferInsert)["companyId"],
+    name: (typeof agents.$inferInsert)["name"],
+    role: (typeof agents.$inferInsert)["role"],
+    status: (typeof agents.$inferInsert)["status"],
+  ): typeof agents.$inferInsert {
+    return {
+      id: rowId,
+      companyId,
+      name,
+      role,
+      status,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    };
+  }
+
+  function selectRecoveryRunsByAgent(agentId: (typeof heartbeatRuns.$inferSelect)["agentId"]) {
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+  }
+
+  function selectRecoveryIssueById(issueId: (typeof issues.$inferSelect)["id"]) {
+    return db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  function selectRecoveryActionsForIssue(issueId: (typeof issueRecoveryActions.$inferSelect)["sourceIssueId"]) {
+    return db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+  }
+
+  async function seedAssignmentHandoffRecovery() {
+    const f = await seedStrandedIssueFixture({
+      status: "in_progress", runStatus: "cancelled", retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_reassigned", runError: "Cancelled before issue reassignment",
+    });
+    const agentId = randomUUID();
+    await db.insert(agents).values(recoveryAgentRow(agentId, f.companyId, "Next engineer", "engineer", "idle"));
+    await db.update(issues).set({ assigneeAgentId: agentId, checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
+    await db.insert(activityLog).values({
+      companyId: f.companyId, actorType: "system", actorId: "fixture", action: "issue.updated",
+      entityType: "issue", entityId: f.issueId,
+      details: { assigneeAgentId: agentId, changes: { assigneeAgentId: { from: f.agentId, to: agentId } }, _previous: { assigneeAgentId: f.agentId } },
+      createdAt: new Date(Date.now() - 1_000),
+    });
+    return { ...f, previousAgentId: f.agentId, agentId };
+  }
+
+  it("recovers a normal issue_reassigned handoff once without charging the previous owner's retries", async () => {
+    const f = await seedAssignmentHandoffRecovery();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    fixtureCleanup.track(release);
+    mockAdapterExecute.mockImplementation(async () => {
+      await held;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Completed handoff fixture" };
+    });
+    const heartbeat = heartbeatService(db);
+    try {
+      await Promise.all([heartbeat.reconcileStrandedAssignedIssues(), heartbeat.reconcileStrandedAssignedIssues()]);
+      await heartbeat.reconcileStrandedAssignedIssues();
+      const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.agentId, f.agentId)));
+      expect(successors).toHaveLength(1);
+      expect(successors[0].retryOfRunId).toBeNull();
+      expect(successors[0].contextSnapshot?.retryOfRunId).toBeUndefined();
+      expect(successors[0].contextSnapshot?.wakeReason).toBe("issue_assigned");
+      expect(await selectRecoveryActionsForIssue(f.issueId)).toHaveLength(0);
+      expect(await selectRecoveryIssueById(f.issueId)).toMatchObject({ assigneeAgentId: f.agentId, status: "in_progress" });
+    } finally {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      release();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
+  it("rejects stale A to B to A service assignment recovery then admits one current successor", async () => {
+    const f = await seedAssignmentHandoffRecovery();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    fixtureCleanup.track(release);
+    mockAdapterExecute.mockImplementation(async () => {
+      await held;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Completed ownership fixture" };
+    });
+    const heartbeat = heartbeatService(db);
+    const { recoveryService } = await import("../services/recovery/service.js");
+    let changed = false;
+    const recovery = recoveryService(db, { enqueueWakeup: async (agentId, options) => {
+      if (!changed) {
+        changed = true;
+        await issueService(db).update(f.issueId, { assigneeAgentId: f.previousAgentId });
+        await issueService(db).update(f.issueId, { assigneeAgentId: f.agentId });
+      }
+      return heartbeat.wakeup(agentId, options);
+    } });
+    try {
+      await recovery.reconcileStrandedAssignedIssues();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      await recovery.reconcileStrandedAssignedIssues();
+      await recovery.reconcileStrandedAssignedIssues();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+      expect(await selectRecoveryActionsForIssue(f.issueId)).toHaveLength(0);
+    } finally {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      release();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
+  it.each(["operator_interrupted", "board", "user"])("does not recover a handoff through an explicit Stop or cancel: %s", async cancellation => {
+    const f = await seedAssignmentHandoffRecovery();
+    await db.update(heartbeatRuns).set({
+      errorCode: cancellation === "operator_interrupted" ? cancellation : "issue_reassigned",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        ...(cancellation === "operator_interrupted" ? {} : { cancelledByActorType: cancellation }) },
+    }).where(eq(heartbeatRuns.id, f.runId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    expect(await selectRecoveryActionsForIssue(f.issueId)).toHaveLength(0);
+  });
+
+  it("re-enqueues a stranded execution-review participant when the latest engineer run was board-cancelled", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const otherAgentId = randomUUID();
+    const otherRunId = randomUUID();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "completed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    await db.insert(agents).values(recoveryAgentRow(otherAgentId, companyId, "CodexImplementor", "engineer", "idle"));
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "cancelled",
+      errorCode: "cancelled",
+      resultJson: { cancelledByActorType: "board" },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_commented",
+      },
+      startedAt: new Date("2026-03-19T00:10:00.000Z"),
+      finishedAt: new Date("2026-03-19T00:15:00.000Z"),
+      createdAt: new Date(Date.now() + 1_000),
+      updatedAt: new Date("2026-03-19T00:15:00.000Z"),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.operatorCancelExempted).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then(
+        (runs) =>
+          runs.find(
+            (row) =>
+              row.id !== runId &&
+              (row.contextSnapshot as Record<string, unknown> | null)
+                ?.retryReason === "execution_review_participant_recovery",
+          ) ?? null,
+      );
+    expect((await selectRecoveryRunsByAgent(agentId)).filter(row => row.retryOfRunId === runId)).toHaveLength(1);
+    expect(retryRun).toMatchObject({
+      retryOfRunId: runId,
+    });
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      currentStageId: stageId,
+      currentStageType: "review",
+    });
   });
 
   it("leaves hidden issues out of stranded-issue reconciliation", async () => {

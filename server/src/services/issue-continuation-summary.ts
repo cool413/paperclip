@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
@@ -12,6 +13,23 @@ const SUMMARY_SECTION_MAX_CHARS = 1_200;
 const PATH_CANDIDATE_RE = /(?:^|[\s`"'(])((?:server|ui|packages|doc|scripts|\.github)\/[A-Za-z0-9._/-]+)/g;
 const WAITING_FOR_REVIEW_OR_APPROVAL_RE =
   /\bwait(?:ing)? for\b.{0,160}\b(?:review(?:er)?(?: feedback)?|approval|board|human|user|operator)\b/i;
+
+type SummaryExecutionVersion = {
+  companyId: string;
+  issueId: string;
+  runId: string;
+  statusVersion: number;
+  executionState: Record<string, unknown> | null;
+};
+
+type IssueExecutionVersionInput = {
+  id: string;
+  companyId: string;
+  statusVersion: number;
+  executionState: Record<string, unknown> | null;
+};
+
+const SUMMARY_EXECUTION_VERSION_RE = /^<!-- paperclip-continuation-version: (.+) -->$/m;
 
 type IssueSummaryInput = {
   id: string;
@@ -134,11 +152,33 @@ export function continuationSummaryParksExecutor(body: string | null | undefined
   return WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(nextAction);
 }
 
+export function readCurrentContinuationSummaryVersion(
+  body: string | null | undefined,
+  issue: IssueExecutionVersionInput,
+): SummaryExecutionVersion | null {
+  const match = body ? SUMMARY_EXECUTION_VERSION_RE.exec(body) : null;
+  if (!match) return null;
+  try {
+    const value: unknown = JSON.parse(match[1]);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const version = value as Record<string, unknown>;
+    if (version.companyId !== issue.companyId || version.issueId !== issue.id
+      || typeof version.runId !== "string" || !version.runId
+      || !Number.isSafeInteger(version.statusVersion) || version.statusVersion !== issue.statusVersion
+      || !isDeepStrictEqual(version.executionState, issue.executionState)) return null;
+    return { companyId: issue.companyId, issueId: issue.id, runId: version.runId,
+      statusVersion: issue.statusVersion, executionState: issue.executionState };
+  } catch {
+    return null;
+  }
+}
+
 export function buildContinuationSummaryMarkdown(input: {
   issue: IssueSummaryInput;
   run: RunSummaryInput;
   agent: AgentSummaryInput;
   previousSummaryBody?: string | null;
+  executionVersion?: SummaryExecutionVersion;
 }) {
   const { issue, run, agent } = input;
   const resultSummary = readResultSummary(run.resultJson);
@@ -163,6 +203,7 @@ export function buildContinuationSummaryMarkdown(input: {
 
   const body = [
     "# Continuation Summary",
+    ...(input.executionVersion ? [`<!-- paperclip-continuation-version: ${JSON.stringify(input.executionVersion)} -->`] : []),
     "",
     `- Issue: ${issue.identifier ?? issue.id} — ${issue.title}`,
     `- Status: ${issue.status}`,
@@ -217,6 +258,7 @@ export function buildContinuationSummaryMarkdown(input: {
 export async function getIssueContinuationSummaryDocument(
   db: Db,
   issueId: string,
+  companyId?: string,
 ): Promise<IssueContinuationSummaryDocument | null> {
   const row = await db
     .select({
@@ -230,7 +272,9 @@ export async function getIssueContinuationSummaryDocument(
     })
     .from(issueDocuments)
     .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-    .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY)))
+    .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
+      companyId ? eq(issueDocuments.companyId, companyId) : undefined,
+      companyId ? eq(documents.companyId, companyId) : undefined))
     .then((rows) => rows[0] ?? null);
 
   if (!row) return null;
@@ -256,6 +300,9 @@ export async function refreshIssueContinuationSummary(input: {
     db
       .select({
         id: issues.id,
+        companyId: issues.companyId,
+        statusVersion: issues.statusVersion,
+        executionState: issues.executionState,
         conversationAgentId: issues.conversationAgentId,
         identifier: issues.identifier,
         title: issues.title,
@@ -274,7 +321,9 @@ export async function refreshIssueContinuationSummary(input: {
     issue,
     run,
     agent,
-    previousSummaryBody: existing?.body ?? null,
+    previousSummaryBody: readCurrentContinuationSummaryVersion(existing?.body, issue) ? existing?.body : null,
+    executionVersion: { companyId: issue.companyId, issueId: issue.id, runId: run.id,
+      statusVersion: issue.statusVersion, executionState: issue.executionState },
   });
   const result = await documentService(db).upsertIssueDocument({
     issueId,
